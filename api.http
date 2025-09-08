@@ -1,0 +1,12 @@
+@base_address = http://localhost:5131
+GET {{base_address}}/products
+###
+POST {{base_address}}/orders
+Content-Type: application/json
+
+{
+  "productId": "f1122ce7-4f70-46ad-8345-01bfb60beb21",
+  "quantity": 150
+}
+###
+GET {{base_address}}/products/f1122ce7-4f70-46ad-8345-01bfb60beb21/events
