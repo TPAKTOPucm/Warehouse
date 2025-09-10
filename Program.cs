@@ -195,11 +195,10 @@ public class Projections
             {
                 var eventData = resolvedEvent.Event.Data.ToArray();
                 // В реальном проекте здесь будет логика выбора типа для десериализации
-                // на основе resolvedEvent.Event.EventType. Для простоты пока используем один тип.
                 var type = Type.GetType(resolvedEvent.Event.EventType);
-                dynamic orderPlacedEvent = JsonSerializer.Deserialize(eventData, type);
-                if (orderPlacedEvent is not null)
-                    product.Apply(orderPlacedEvent); // <--- Ключевой момент!
+                dynamic @event = JsonSerializer.Deserialize(eventData, type);
+                if (@event is not null)
+                    product.Apply(@event); // <--- Ключевой момент!
             }
         }
         catch (StreamNotFoundException)
@@ -211,4 +210,3 @@ public class Projections
     }
 
 }
-
