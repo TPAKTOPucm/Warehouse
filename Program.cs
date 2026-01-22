@@ -1,5 +1,6 @@
 using EventStore.Client;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.ChangeTracking.Internal;
 using System.Text;
 using System.Text.Json;
 using static Microsoft.EntityFrameworkCore.DbLoggerCategory.Database;
@@ -113,6 +114,14 @@ public record CancelOrderCommand(Guid ProductId, int Quantity);
 
 public record ProductRestockCommand(Guid ProductId, int Quantity);
 
+public class Snapshot
+{
+    public Guid AggregateId { get; set; }
+    public int Version { get; set; } // номер последнего события, включённого в снэпшот
+    public string StateJson { get; set; } = default!;
+    public DateTime CreatedAt { get; set; } = DateTime.UtcNow;
+}
+
 public class Product
 {
     public Guid Id { get; private set; }
@@ -146,6 +155,7 @@ public class Product
 public class WarehouseDbContext : DbContext
 {
     public DbSet<Product> Products { get; set; }
+    public DbSet<Snapshot> Snapshots { get; set; }
 
     public WarehouseDbContext(DbContextOptions<WarehouseDbContext> options) : base(options)
     {
@@ -159,6 +169,7 @@ public class WarehouseDbContext : DbContext
     {
         base.OnModelCreating(modelBuilder);
         modelBuilder.Entity<Product>().HasKey(p => p.Id);
+        modelBuilder.Entity<Snapshot>().HasKey(s => s.AggregateId);
     }
 }
 
@@ -166,26 +177,50 @@ public class Projections
 {
     public static async Task<Product?> GetProductProjection(Guid productId, EventStoreClient client, WarehouseDbContext db)
     {
-        var product = await db.Products.FindAsync(productId);
-        if (product == null) return null;
+        var snapshot = await db.Snapshots.FindAsync(productId);
+        Product product;
+        StreamPosition startFrom;
 
-        try
+        if (snapshot != null)
         {
-            var events = client.ReadStreamAsync(Direction.Forwards, $"product-{productId}", StreamPosition.Start);
+            product = JsonSerializer.Deserialize<Product>(snapshot.StateJson)!;
+            startFrom = new StreamPosition((ulong)snapshot.Version + 1);
+        }
+        else
+        {
+            product = new Product(productId, 0);
+            startFrom = StreamPosition.Start;
+        }
 
-            await foreach (var resolvedEvent in events)
+        var events = client.ReadStreamAsync(Direction.Forwards, $"product-{productId}", startFrom);
+        var version = snapshot?.Version ?? 0;
+
+        await foreach (var resolvedEvent in events)
+        {
+            version++;
+            var eventData = resolvedEvent.Event.Data.ToArray();
+            var type = Type.GetType(resolvedEvent.Event.EventType);
+            dynamic orderPlacedEvent = JsonSerializer.Deserialize(eventData, type);
+            if (orderPlacedEvent is not null)
+                product.Apply(orderPlacedEvent);
+        }
+
+        if (version % 10 == 0 && version > 0)
+        {
+            var existing = await db.Snapshots.FindAsync(productId);
+            var newSnapshot = new Snapshot
             {
-                var eventData = resolvedEvent.Event.Data.ToArray();
-                var type = Type.GetType(resolvedEvent.Event.EventType);
-                dynamic orderPlacedEvent = JsonSerializer.Deserialize(eventData, type);
-                if (orderPlacedEvent is not null)
-                    product.Apply(orderPlacedEvent);
-            }
+                AggregateId = productId,
+                Version = version,
+                StateJson = JsonSerializer.Serialize(product)
+            };
+
+            if (existing != null)
+                db.Snapshots.Remove(existing);
+            db.Snapshots.Add(newSnapshot);
+            await db.SaveChangesAsync();
         }
-        catch (StreamNotFoundException)
-        {
-            return product;
-        }
+
         return product;
     }
 
