@@ -7,11 +7,9 @@ using static Microsoft.EntityFrameworkCore.DbLoggerCategory.Database;
 var builder = WebApplication.CreateBuilder(args);
 builder.Services.AddEndpointsApiExplorer();
 builder.Services.AddSwaggerGen();
-
-// Регистрация клиента для EventStoreDB
+builder.Services.AddHostedService<EventProjectionService>();
 builder.Services.AddEventStoreClient("esdb://localhost:2113?tls=false");
 
-// Регистрация DbContext для PostgreSQL
 builder.Services.AddDbContext<WarehouseDbContext>(options =>
 {
     options.UseNpgsql("Host=localhost;Port=5432;Database=warehouse;Username=postgres;Password=postgres",
@@ -22,25 +20,20 @@ var app = builder.Build();
 
 app.MapPost("/orders", async (PlaceOrderCommand command, EventStoreClient client, WarehouseDbContext db) =>
 {
-    // Получаем текущее состояние товара через проекцию
     var product = await Projections.GetProductProjection(command.ProductId, client, db);
 
-    // Проверяем бизнес-логику (достаточно ли товара)
     if (product.QuantityInStock >= command.Quantity)
     {
-        // Создаем экземпляр события, используя конструктор record'а
         var orderPlacedEvent = new OrderPlacedEvent(command.ProductId, command.Quantity);
-        // Готовим событие к отправке (сериализуем в JSON/UTF8)
         var eventData = new EventData(
             Uuid.NewUuid(),
-            nameof(OrderPlacedEvent), // Имя события - теперь безопасно получаем из типа
-            JsonSerializer.SerializeToUtf8Bytes((object)orderPlacedEvent) // Приводим к object для полиморфизма
+            nameof(OrderPlacedEvent),
+            JsonSerializer.SerializeToUtf8Bytes((object)orderPlacedEvent)
         );
 
-        // Записываем событие в поток, связанный с продуктом
         await client.AppendToStreamAsync(
-            $"product-{command.ProductId}", // Имя потока
-            StreamState.Any, // Не проверяем версию потока
+            $"product-{command.ProductId}",
+            StreamState.Any,
             new[] { eventData }
         );
 
@@ -89,32 +82,25 @@ app.MapGet("/products", async (WarehouseDbContext db) => { return await db.Produ
 
 app.MapGet("/products/{productId}/events", (Guid productId, EventStoreClient client) =>
 {
-    // Читаем поток событий для продукта от начала до конца
     var events = client.ReadStreamAsync(
         Direction.Forwards,
         $"product-{productId}",
         StreamPosition.Start
     );
-    // Десериализуем и возвращаем каждое событие
     return events.Select(e => JsonSerializer.Deserialize<OrderPlacedEvent>(e.Event.Data.ToArray()));
 });
 app.UseSwagger();
 app.UseSwaggerUI();
 app.Run();
 
-// Базовый интерфейс для всех событий, добавляющий метаданные
 public interface IEvent
 {
-    // Альтернатива - https://github.com/phatboyg/NewId
     Guid EventId => Guid.NewGuid();
     public DateTime OccurredOn => DateTime.UtcNow;
 }
 
-// Маркерный интерфейс для доменных событий.
 public interface IDomainEvent : IEvent { }
 
-// Событие, описывающее факт размещения заказа,
-// определенное как неизменяемый record
 public record OrderPlacedEvent(Guid ProductId, int Quantity) : IDomainEvent;
 
 public record OrderCancelledEvent(Guid ProductId, int Quantity) : IDomainEvent;
@@ -138,7 +124,6 @@ public class Product
         QuantityInStock = quantityInStock;
     }
 
-    // Apply events to mutate the state of the product.
     public void Apply(OrderPlacedEvent @event)
     {
         if (QuantityInStock >= @event.Quantity)
@@ -181,32 +166,75 @@ public class Projections
 {
     public static async Task<Product?> GetProductProjection(Guid productId, EventStoreClient client, WarehouseDbContext db)
     {
-        // Получаем "снимок" или начальное состояние из PostgreSQL
         var product = await db.Products.FindAsync(productId);
         if (product == null) return null;
 
         try
         {
-            // Читаем поток событий, связанных с этим продуктом
             var events = client.ReadStreamAsync(Direction.Forwards, $"product-{productId}", StreamPosition.Start);
 
-            // В цикле применяем каждое событие к состоянию объекта
             await foreach (var resolvedEvent in events)
             {
                 var eventData = resolvedEvent.Event.Data.ToArray();
-                // В реальном проекте здесь будет логика выбора типа для десериализации
                 var type = Type.GetType(resolvedEvent.Event.EventType);
-                dynamic @event = JsonSerializer.Deserialize(eventData, type);
-                if (@event is not null)
-                    product.Apply(@event); // <--- Ключевой момент!
+                dynamic orderPlacedEvent = JsonSerializer.Deserialize(eventData, type);
+                if (orderPlacedEvent is not null)
+                    product.Apply(orderPlacedEvent);
             }
         }
         catch (StreamNotFoundException)
         {
-            // Если событий еще не было, просто возвращаем начальное состояние
             return product;
         }
         return product;
     }
 
+}
+
+public class EventProjectionService : BackgroundService
+{
+    private readonly EventStoreClient _eventStoreClient;
+    private readonly ILogger<EventProjectionService> _logger;
+    private readonly IServiceProvider _serviceProvider;
+
+    public EventProjectionService(EventStoreClient eventStoreClient, ILogger<EventProjectionService> logger, IServiceProvider serviceProvider)
+    {
+        _eventStoreClient = eventStoreClient;
+        _logger = logger;
+        _serviceProvider = serviceProvider;
+    }
+
+    protected override Task ExecuteAsync(CancellationToken stoppingToken) => _eventStoreClient.SubscribeToStreamAsync(
+            "$ce-product",
+            FromStream.End,
+            async (subscription, resolvedEvent, ct) =>
+            {
+                try
+                {
+                    using var scope = _serviceProvider.CreateScope();
+                    var dbContext = scope.ServiceProvider.GetRequiredService<WarehouseDbContext>();
+
+                    var eventData = resolvedEvent.Event.Data.ToArray();
+                    var type = Type.GetType(resolvedEvent.Event.EventType);
+                    dynamic domainEvent = JsonSerializer.Deserialize(eventData, type);
+
+                    if (domainEvent is not null)
+                    {
+                        await ApplyProjection(dbContext, domainEvent);
+                        await dbContext.SaveChangesAsync(ct);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "Error processing event {EventId}", resolvedEvent.Event.EventId);
+                }
+            },
+            cancellationToken: stoppingToken
+        );
+
+    private static async Task ApplyProjection(WarehouseDbContext db, dynamic domainEvent)
+    {
+        Product product = await db.Products.FindAsync(domainEvent.ProductId);
+        product.Apply(domainEvent);
+    }
 }
